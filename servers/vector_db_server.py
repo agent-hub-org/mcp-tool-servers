@@ -179,12 +179,54 @@ def retrieve_papers(query: str, top_k: int = 5) -> str:
         return f"Retrieval failed: {e}"
 
 
+def _rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[dict]:
+    """Rerank arxiv candidates by embedding similarity to the query.
+
+    Each candidate dict must have 'title' and 'summary' keys.
+    Returns the top_n most relevant candidates sorted by cosine similarity.
+    """
+    if len(candidates) <= top_n:
+        return candidates
+
+    db = _get_db("research-papers")
+
+    # Build a text representation for each candidate
+    candidate_texts = [
+        f"{c['title']}. {c['summary']}" for c in candidates
+    ]
+
+    # Embed query and all candidates in one batch
+    query_vector = db.embeddings.embed_query(query)
+    candidate_vectors = db.embeddings.embed_documents(candidate_texts)
+
+    # Compute cosine similarity (vectors are already normalized by most embedding models)
+    similarities = []
+    for i, cvec in enumerate(candidate_vectors):
+        dot = sum(q * c for q, c in zip(query_vector, cvec))
+        similarities.append((i, dot))
+
+    # Sort by similarity descending, take top_n
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    reranked = []
+    for idx, score in similarities[:top_n]:
+        candidates[idx]["_relevance_score"] = round(score, 4)
+        reranked.append(candidates[idx])
+
+    logger.info("Reranked %d candidates → top %d (scores: %.3f – %.3f)",
+                len(candidates), len(reranked),
+                reranked[0].get("_relevance_score", 0),
+                reranked[-1].get("_relevance_score", 0))
+
+    return reranked
+
+
 @mcp.tool()
 def download_and_store_arxiv_papers(query: str, max_results: int = 5,
                                      sort_by: str = "relevance",
                                      categories: str = "") -> str:
     """Search arXiv, download PDFs, convert to markdown, and store in the vector DB.
-    Returns a summary of downloaded papers.
+    Fetches a larger pool of candidates from arXiv, then reranks them by semantic
+    similarity to the query and only downloads the most relevant ones.
 
     Args:
         query: Search query — use precise academic terms for best results.
@@ -209,9 +251,8 @@ def download_and_store_arxiv_papers(query: str, max_results: int = 5,
             cat_filter = " OR ".join(f"cat:{c.strip()}" for c in categories.split(",") if c.strip())
             full_query = f"({query}) AND ({cat_filter})"
 
-        # Fetch more candidates than needed, then take top max_results
-        # This helps when some results are low quality
-        fetch_count = max_results * 2
+        # Fetch 3x candidates so we have a good pool to rerank from
+        fetch_count = max_results * 3
         search = arxiv.Search(
             query=full_query,
             max_results=fetch_count,
@@ -219,45 +260,76 @@ def download_and_store_arxiv_papers(query: str, max_results: int = 5,
             sort_order=arxiv.SortOrder.Descending,
         )
 
-        download_dir = Path("papers")
-        download_dir.mkdir(exist_ok=True)
-
-        papers = []
+        # Collect candidate metadata first (no PDF download yet)
+        candidates = []
         for paper in _arxiv_client.results(search):
-            if len(papers) >= max_results:
-                break
-
-            file_name = f"{paper.get_short_id()}.pdf"
-            file_path = download_dir / file_name
-
-            logger.info("Downloading paper: '%s' → %s", paper.title, file_path)
-            paper.download_pdf(dirpath=str(download_dir), filename=file_name)
-
-            papers.append({
+            candidates.append({
                 "title": paper.title,
                 "authors": [a.name for a in paper.authors],
                 "summary": paper.summary,
-                "pdf_path": str(file_path),
                 "pdf_url": paper.pdf_url,
+                "short_id": paper.get_short_id(),
                 "categories": list(paper.categories),
                 "published": paper.published.strftime("%Y-%m-%d") if paper.published else "",
             })
 
-        if not papers:
+        if not candidates:
             return "No papers found on arXiv for this query."
+
+        logger.info("Fetched %d candidates from arXiv, reranking to select top %d",
+                     len(candidates), max_results)
+
+        # Rerank by embedding similarity — only keep the most relevant papers
+        top_candidates = _rerank_candidates(query, candidates, max_results)
+
+        # Now download PDFs only for the reranked top papers
+        download_dir = Path("papers")
+        download_dir.mkdir(exist_ok=True)
+
+        papers = []
+        for candidate in top_candidates:
+            file_name = f"{candidate['short_id']}.pdf"
+            file_path = download_dir / file_name
+
+            logger.info("Downloading paper: '%s' (relevance: %.3f) → %s",
+                        candidate["title"],
+                        candidate.get("_relevance_score", 0),
+                        file_path)
+
+            # Re-fetch the paper object to download the PDF
+            paper_search = arxiv.Search(id_list=[candidate["short_id"]])
+            paper_obj = next(_arxiv_client.results(paper_search), None)
+            if paper_obj is None:
+                logger.warning("Could not re-fetch paper '%s', skipping", candidate["short_id"])
+                continue
+            paper_obj.download_pdf(dirpath=str(download_dir), filename=file_name)
+
+            papers.append({
+                "title": candidate["title"],
+                "authors": candidate["authors"],
+                "summary": candidate["summary"],
+                "pdf_path": str(file_path),
+                "pdf_url": candidate["pdf_url"],
+                "categories": candidate["categories"],
+                "published": candidate["published"],
+            })
+
+        if not papers:
+            return "No papers could be downloaded."
 
         db = _get_db("research-papers")
         db.upsert_papers(papers)
 
         summaries = []
-        for p in papers:
+        for i, p in enumerate(papers):
             authors = ", ".join(p["authors"][:3])
             if len(p["authors"]) > 3:
                 authors += " et al."
             date_str = f" ({p['published']})" if p.get("published") else ""
-            summaries.append(f"- **{p['title']}** by {authors}{date_str}")
+            score_str = f" [relevance: {top_candidates[i].get('_relevance_score', 'N/A')}]"
+            summaries.append(f"- **{p['title']}** by {authors}{date_str}{score_str}")
 
-        return f"Downloaded and stored {len(papers)} papers:\n" + "\n".join(summaries)
+        return f"Downloaded and stored {len(papers)} papers (reranked from {len(candidates)} candidates):\n" + "\n".join(summaries)
     except Exception as e:
         logger.error("Error downloading arXiv papers: %s", e)
         return f"Failed to download papers: {e}"
