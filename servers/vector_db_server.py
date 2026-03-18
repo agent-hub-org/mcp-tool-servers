@@ -180,17 +180,53 @@ def retrieve_papers(query: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
-def download_and_store_arxiv_papers(query: str, max_results: int = 5) -> str:
+def download_and_store_arxiv_papers(query: str, max_results: int = 5,
+                                     sort_by: str = "relevance",
+                                     categories: str = "") -> str:
     """Search arXiv, download PDFs, convert to markdown, and store in the vector DB.
-    Returns a summary of downloaded papers."""
-    logger.info("Downloading arXiv papers — query='%s', max_results=%d", query, max_results)
+    Returns a summary of downloaded papers.
+
+    Args:
+        query: Search query — use precise academic terms for best results.
+        max_results: Max papers to download (default 5). Keep small for targeted searches.
+        sort_by: Sort order — 'relevance' (default), 'submitted' (newest first), or 'updated'.
+        categories: Optional comma-separated arXiv categories to filter by
+                    (e.g., 'cs.AI,cs.CL,cs.LG'). Leave empty for all categories.
+    """
+    logger.info("Downloading arXiv papers — query='%s', max_results=%d, sort='%s', categories='%s'",
+                query, max_results, sort_by, categories)
     try:
-        search = arxiv.Search(query=query, max_results=max_results)
+        sort_map = {
+            "relevance": arxiv.SortCriterion.Relevance,
+            "submitted": arxiv.SortCriterion.SubmittedDate,
+            "updated": arxiv.SortCriterion.LastUpdatedDate,
+        }
+        sort_criterion = sort_map.get(sort_by, arxiv.SortCriterion.Relevance)
+
+        # Build the full query with optional category filtering
+        full_query = query
+        if categories:
+            cat_filter = " OR ".join(f"cat:{c.strip()}" for c in categories.split(",") if c.strip())
+            full_query = f"({query}) AND ({cat_filter})"
+
+        # Fetch more candidates than needed, then take top max_results
+        # This helps when some results are low quality
+        fetch_count = max_results * 2
+        search = arxiv.Search(
+            query=full_query,
+            max_results=fetch_count,
+            sort_by=sort_criterion,
+            sort_order=arxiv.SortOrder.Descending,
+        )
+
         download_dir = Path("papers")
         download_dir.mkdir(exist_ok=True)
 
         papers = []
         for paper in _arxiv_client.results(search):
+            if len(papers) >= max_results:
+                break
+
             file_name = f"{paper.get_short_id()}.pdf"
             file_path = download_dir / file_name
 
@@ -203,6 +239,8 @@ def download_and_store_arxiv_papers(query: str, max_results: int = 5) -> str:
                 "summary": paper.summary,
                 "pdf_path": str(file_path),
                 "pdf_url": paper.pdf_url,
+                "categories": list(paper.categories),
+                "published": paper.published.strftime("%Y-%m-%d") if paper.published else "",
             })
 
         if not papers:
@@ -216,7 +254,8 @@ def download_and_store_arxiv_papers(query: str, max_results: int = 5) -> str:
             authors = ", ".join(p["authors"][:3])
             if len(p["authors"]) > 3:
                 authors += " et al."
-            summaries.append(f"- **{p['title']}** by {authors}")
+            date_str = f" ({p['published']})" if p.get("published") else ""
+            summaries.append(f"- **{p['title']}** by {authors}{date_str}")
 
         return f"Downloaded and stored {len(papers)} papers:\n" + "\n".join(summaries)
     except Exception as e:
