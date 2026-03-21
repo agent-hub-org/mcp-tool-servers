@@ -5,7 +5,7 @@ from typing import Any
 
 import pymupdf4llm
 from pinecone import Pinecone, ServerlessSpec
-from langchain_azure_ai.embeddings import AzureAIOpenAIApiEmbeddingsModel
+from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger("mcp_tool_servers.vector_db")
@@ -29,9 +29,9 @@ class VectorDB:
         self.index_name = index_name
         self.pinecone = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 
-        self.embeddings = AzureAIOpenAIApiEmbeddingsModel(
-            endpoint=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
-            credential=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
+        self.embeddings = OpenAIEmbeddings(
+            base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
+            api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
             model="text-embedding-3-large",
         )
 
