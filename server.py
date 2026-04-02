@@ -4,9 +4,13 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import arxiv
+import base64
+import re
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -21,6 +25,10 @@ from shared.vector_db import VectorDB
 logger = logging.getLogger("mcp_tool_servers")
 
 mcp = FastMCP("mcp-tool-servers", instructions="Web search, finance data, and vector DB tools.")
+
+# ── Macro data cache (6-hour TTL) ──
+_macro_cache: dict[str, tuple[float, str]] = {}
+_CACHE_TTL = 6 * 3600
 
 
 # ── Lazy clients ──────────────────────────────────────────────
@@ -149,6 +157,170 @@ def get_bse_nse_reports(ticker: str) -> str:
     except Exception as e:
         logger.error("Error fetching financial reports for ticker='%s': %s", ticker, e)
         return f"Failed to fetch reports for {ticker}: {e}"
+
+
+@mcp.tool()
+def get_historical_ohlcv(ticker: str, period: str = "1y", interval: str = "1d") -> str:
+    """Get price history summary and trend analysis for a ticker symbol.
+    Returns multi-timeframe returns, monthly price series, moving averages, and volume.
+    period options: 1mo, 3mo, 6mo, 1y, 2y, 5y
+    interval options: 1d, 1wk, 1mo
+    For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g., 'RELIANCE.NS'."""
+    logger.info("Fetching OHLCV history for ticker='%s', period='%s'", ticker, period)
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period=period, interval=interval)
+        if hist.empty:
+            return f"No price history found for {ticker}."
+
+        latest_close = float(hist["Close"].iloc[-1])
+        high_52w = float(hist["High"].max())
+        low_52w = float(hist["Low"].min())
+
+        lookbacks = {"5d": 5, "1m": 21, "3m": 63, "6m": 126, "1y": 252}
+        return_parts = []
+        for label, n in lookbacks.items():
+            if len(hist) >= n:
+                past = float(hist["Close"].iloc[-n])
+                pct = ((latest_close - past) / past) * 100
+                return_parts.append(f"{label}: {pct:+.1f}%")
+
+        monthly = hist["Close"].resample("ME").last().tail(12)
+        monthly_str = "  ".join(
+            f"{d.strftime('%b %y')}: {v:.1f}" for d, v in monthly.items()
+        )
+
+        sma_50 = float(hist["Close"].tail(50).mean())
+        sma_200_str = ""
+        if len(hist) >= 200:
+            sma_200 = float(hist["Close"].tail(200).mean())
+            sma_200_str = f" | SMA 200: {sma_200:.2f}"
+
+        avg_vol_10d = int(hist["Volume"].tail(10).mean())
+        avg_vol_30d = int(hist["Volume"].tail(30).mean())
+
+        lines = [
+            f"## {ticker} Price Analysis ({period})",
+            f"Latest Close: {latest_close:.2f}",
+            f"52W High: {high_52w:.2f} | 52W Low: {low_52w:.2f}",
+            f"Returns: {' | '.join(return_parts)}",
+            f"SMA 50: {sma_50:.2f}{sma_200_str}",
+            f"Avg Volume: 10d = {avg_vol_10d:,} | 30d = {avg_vol_30d:,}",
+            f"Monthly Closes: {monthly_str}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("Error fetching OHLCV for ticker='%s': %s", ticker, e)
+        return f"Failed to fetch price history for {ticker}: {e}"
+
+
+@mcp.tool()
+def get_macro_indicators() -> str:
+    """Fetch key Indian and global macro market indicators.
+    Returns USD/INR, Brent Crude, Gold, US 10Y Treasury yield, Nifty 50, Sensex,
+    India VIX, and US Dollar Index — all with day-over-day change.
+    Results are cached for 6 hours.
+    Note: For RBI repo rate and CPI/IIP data use tavily_quick_search('RBI repo rate India 2026')."""
+    cache_key = "macro_indicators"
+    now = time.time()
+    if cache_key in _macro_cache:
+        ts, cached = _macro_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            logger.info("Returning cached macro indicators")
+            return cached
+
+    logger.info("Fetching macro indicators from yfinance")
+    indicators = [
+        ("USDINR=X", "USD/INR"),
+        ("BZ=F", "Brent Crude (USD/bbl)"),
+        ("GC=F", "Gold (USD/oz)"),
+        ("^TNX", "US 10Y Yield (%)"),
+        ("^NSEI", "Nifty 50"),
+        ("^BSESN", "BSE Sensex"),
+        ("^INDIAVIX", "India VIX"),
+        ("DX-Y.NYB", "US Dollar Index"),
+    ]
+
+    lines = ["## Indian & Global Macro Indicators",
+             "*(For RBI repo rate / CPI / IIP use tavily_quick_search)*", ""]
+    fetched = 0
+    for symbol, label in indicators:
+        try:
+            info = yf.Ticker(symbol).fast_info
+            price = info.last_price
+            prev = info.previous_close
+            if price is None:
+                continue
+            if prev and prev != 0:
+                chg = ((price - prev) / prev) * 100
+                sign = "+" if chg >= 0 else ""
+                lines.append(f"**{label}:** {price:.2f} ({sign}{chg:.2f}%)")
+            else:
+                lines.append(f"**{label}:** {price:.2f}")
+            fetched += 1
+        except Exception as e:
+            logger.warning("Skipping %s (%s): %s", symbol, label, e)
+
+    if fetched == 0:
+        return "Failed to fetch macro indicators. Use tavily_quick_search for current data."
+
+    result = "\n".join(lines)
+    _macro_cache[cache_key] = (now, result)
+    return result
+
+
+@mcp.tool()
+def get_fii_dii_flows(days: int = 30) -> str:
+    """Fetch FII/DII equity trading activity from NSE India for the last N trading days.
+    Returns gross buy, gross sell, and net investment values in crores INR.
+    FII (Foreign Institutional Investors) and DII (Domestic Institutional Investors) flows
+    are a key indicator of institutional sentiment in Indian equity markets."""
+    logger.info("Fetching FII/DII flows for last %d days", days)
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/",
+        })
+        session.get("https://www.nseindia.com", timeout=15)
+
+        resp = session.get(
+            "https://www.nseindia.com/api/fiidiiTradeReact",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data:
+            return "No FII/DII data returned from NSE."
+
+        recent = data[:days]
+        lines = [f"## FII/DII Equity Flows — Last {len(recent)} Trading Days (NSE)", ""]
+        for entry in recent:
+            category = entry.get("category", "?")
+            date = entry.get("date", "")
+            buy_val = entry.get("buyValue", "0")
+            sell_val = entry.get("sellValue", "0")
+            net_val = entry.get("netValue", "0")
+            net_float = float(str(net_val).replace(",", ""))
+            sentiment = "NET BUYER" if net_float >= 0 else "NET SELLER"
+            lines.append(
+                f"**{date}** | {category} | Buy: ₹{buy_val}Cr | Sell: ₹{sell_val}Cr "
+                f"| Net: ₹{net_val}Cr ({sentiment})"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("NSE FII/DII fetch failed: %s", e)
+        return (
+            f"NSE FII/DII data unavailable: {e}. "
+            "Fallback: use tavily_quick_search('FII DII net investment India equity today')."
+        )
 
 
 # ── Vector DB Tools ───────────────────────────────────────────
@@ -433,6 +605,165 @@ def download_and_store_arxiv_papers(query: str, max_results: int = 5,
     except Exception as e:
         logger.error("Error downloading arXiv papers: %s", e)
         return f"Failed to download papers: {e}"
+
+
+# ── GitHub Tools ──────────────────────────────────────────────
+
+_GITHUB_TOKEN: str | None = os.getenv("GITHUB_TOKEN")
+_GH_HEADERS: dict[str, str] = {
+    "Accept": "application/vnd.github.v3+json",
+    "User-Agent": "mcp-tool-servers/1.0",
+}
+if _GITHUB_TOKEN:
+    _GH_HEADERS["Authorization"] = f"Bearer {_GITHUB_TOKEN}"
+
+_GH_SKIP = re.compile(
+    r"(node_modules|\.git|__pycache__|\.venv|venv|dist|build|coverage"
+    r"|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.idea|\.vscode"
+    r"|migrations|fixtures|vendor|\.next|\.nuxt)/|"
+    r"\.(pyc|pyo|so|dylib|dll|exe|bin|lock|svg|png|jpg|jpeg|gif|ico"
+    r"|woff2?|ttf|otf|eot|map|min\.js|min\.css)$",
+    re.IGNORECASE,
+)
+_GH_PRIORITY = [
+    (10, re.compile(r"^README", re.IGNORECASE)),
+    (9,  re.compile(r"^(main|app|index|server|core)\.(py|ts|js|go|java|rs|rb)$")),
+    (8,  re.compile(r"^(pyproject\.toml|package\.json|go\.mod|Cargo\.toml|pom\.xml|build\.gradle)$")),
+    (7,  re.compile(r"\.(py|ts|go|java|rs|rb|jsx|tsx)$")),
+    (6,  re.compile(r"\.(js|c|cpp|h|cs|swift|kt)$")),
+    (5,  re.compile(r"\.(ya?ml|toml|json|env\.example)$")),
+    (4,  re.compile(r"\.(md|txt)$")),
+]
+_GH_MAX_BYTES = 60_000
+_GH_TIMEOUT = 20
+
+
+def _gh_file_priority(path: str) -> int:
+    name = os.path.basename(path)
+    for score, pattern in _GH_PRIORITY:
+        if pattern.search(name):
+            return score
+    return 3
+
+
+def _gh_validate_url(repo_url: str) -> tuple[str, str]:
+    """Validate a GitHub URL and return (owner, repo). Raises ValueError on failure."""
+    url = repo_url.strip().rstrip("/")
+    normalized = re.sub(r"^https?://(www\.)?", "", url, flags=re.IGNORECASE)
+    if not normalized.lower().startswith("github.com/"):
+        raise ValueError(f"Only public github.com repositories are supported. Got: {url!r}")
+    path_part = re.split(r"[?#]", normalized[len("github.com/"):])[0]
+    parts = [p for p in path_part.split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(f"Cannot parse owner/repo from URL {url!r}")
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    _valid = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
+    if not _valid.match(owner) or not _valid.match(repo):
+        raise ValueError(f"Invalid owner/repo characters in URL: {url!r}")
+    return owner, repo
+
+
+@mcp.tool()
+def fetch_github_repo(repo_url: str, max_files: int = 40) -> str:
+    """Fetch key source files from a public GitHub repository for code analysis.
+
+    Args:
+        repo_url: Public GitHub URL (https://github.com/owner/repo). Only public repos.
+        max_files: Files to fetch content for (1–60, default 40).
+
+    Returns JSON with: repo_url, repo_name, owner, language, description,
+    file_tree, key_files [{path, content}], summary, total_files.
+    Returns "Error: ..." on failure.
+    """
+    try:
+        owner, repo = _gh_validate_url(repo_url)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    repo_full = f"{owner}/{repo}"
+    max_files = max(1, min(int(max_files), 60))
+
+    try:
+        meta_res = requests.get(
+            f"https://api.github.com/repos/{repo_full}",
+            headers=_GH_HEADERS, timeout=_GH_TIMEOUT,
+        )
+        if meta_res.status_code == 404:
+            return f"Error: Repository not found or is private: {repo_full}"
+        if meta_res.status_code == 403:
+            return f"Error: Access denied for {repo_full}. Only public repositories are supported."
+        if not meta_res.ok:
+            return f"Error: GitHub API returned {meta_res.status_code} for {repo_full}"
+        meta = meta_res.json()
+
+        default_branch = meta.get("default_branch", "main")
+        tree_res = requests.get(
+            f"https://api.github.com/repos/{repo_full}/git/trees/{default_branch}?recursive=1",
+            headers=_GH_HEADERS, timeout=_GH_TIMEOUT,
+        )
+        if not tree_res.ok:
+            return f"Error: Failed to fetch file tree (status {tree_res.status_code})"
+
+        all_blobs = [
+            item for item in tree_res.json().get("tree", [])
+            if item["type"] == "blob" and not _GH_SKIP.search(item["path"])
+        ]
+        all_blobs.sort(key=lambda f: (-_gh_file_priority(f["path"]), len(f["path"])))
+
+        key_files: list[dict[str, str]] = []
+        for item in all_blobs[:max_files]:
+            try:
+                cr = requests.get(
+                    f"https://api.github.com/repos/{repo_full}/contents/{item['path']}",
+                    headers=_GH_HEADERS, timeout=_GH_TIMEOUT,
+                )
+                if not cr.ok:
+                    continue
+                fj = cr.json()
+                if fj.get("encoding") != "base64":
+                    continue
+                raw = base64.b64decode(fj["content"]).decode("utf-8", errors="replace")
+                if len(raw) > _GH_MAX_BYTES:
+                    raw = raw[:_GH_MAX_BYTES] + f"\n\n... [truncated at {_GH_MAX_BYTES} bytes]"
+                key_files.append({"path": item["path"], "content": raw})
+            except Exception as exc:
+                logger.warning("Skipping %s: %s", item["path"], exc)
+
+        all_paths = [item["path"] for item in all_blobs[:200]]
+        language = meta.get("language") or "unknown"
+        description = meta.get("description") or ""
+
+        summary_parts = []
+        if description:
+            summary_parts.append(f"Description: {description}")
+        summary_parts.extend([
+            f"Primary language: {language}",
+            f"Total visible files: {len(all_blobs)}",
+            f"Files fetched: {len(key_files)}",
+        ])
+        if all_paths:
+            summary_parts.append("\nFile tree (up to 80 paths):")
+            summary_parts.extend(f"  {p}" for p in all_paths[:80])
+
+        return json.dumps({
+            "repo_url": repo_url,
+            "repo_name": repo,
+            "owner": owner,
+            "language": language,
+            "description": description,
+            "file_tree": all_paths,
+            "key_files": key_files,
+            "summary": "\n".join(summary_parts),
+            "total_files": len(all_blobs),
+        })
+
+    except requests.exceptions.Timeout:
+        return f"Error: Request timed out fetching {repo_full}."
+    except requests.exceptions.ConnectionError as exc:
+        return f"Error: Connection failed for {repo_full}: {exc}"
+    except Exception as exc:
+        logger.error("Unexpected error fetching repo %s: %s", repo_full, exc)
+        return f"Error: Unexpected failure fetching {repo_full}: {exc}"
 
 
 if __name__ == "__main__":
