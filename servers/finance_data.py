@@ -8,6 +8,7 @@ import yfinance as yf
 from cachetools import cached, TTLCache
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -20,6 +21,17 @@ logger = logging.getLogger("mcp_tool_servers.finance_data")
 mcp = FastMCP("finance-data", instructions="Financial market data and reports tools.")
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _yf_get_info(ticker: str) -> dict:
+    """Inner fetch for yfinance info — retried on transient failures."""
+    return yf.Ticker(ticker).info
+
+
 @mcp.tool()
 @cached(cache=TTLCache(maxsize=100, ttl=1800))
 def get_ticker_data(ticker: str) -> str:
@@ -28,8 +40,7 @@ def get_ticker_data(ticker: str) -> str:
     Returns current price, market cap, P/E ratios, and a business summary."""
     logger.info("Fetching market data for ticker='%s'", ticker)
     try:
-        t = yf.Ticker(ticker)
-        info = t.info
+        info = _yf_get_info(ticker)
         relevant_keys = [
             "shortName", "symbol", "currentPrice", "marketCap", "sector", "industry",
             "trailingPE", "forwardPE", "dividendYield", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
@@ -41,6 +52,17 @@ def get_ticker_data(ticker: str) -> str:
     except Exception as e:
         logger.error("Error fetching data for ticker='%s': %s", ticker, e)
         return f"Failed to fetch data for {ticker}: {e}"
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _yf_fetch_report(fetch_fn) -> object:
+    """Inner fetch for a single yfinance report — retried on transient failures."""
+    return fetch_fn()
 
 
 @mcp.tool()
@@ -66,7 +88,7 @@ def get_bse_nse_reports(ticker: str) -> str:
         missing: list[str] = []
         for title, fetch_fn in report_sources:
             try:
-                df = fetch_fn()
+                df = _yf_fetch_report(fetch_fn)
                 if not df.empty:
                     results.append(f"## {ticker} {title}\n\n{df.to_markdown()}")
                 else:
@@ -86,6 +108,17 @@ def get_bse_nse_reports(ticker: str) -> str:
         return f"Failed to fetch reports for {ticker}: {e}"
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _yf_get_history(ticker: str, period: str, interval: str):
+    """Inner fetch for yfinance price history — retried on transient failures."""
+    return yf.Ticker(ticker).history(period=period, interval=interval)
+
+
 @mcp.tool()
 @cached(cache=TTLCache(maxsize=100, ttl=3600))
 def get_historical_ohlcv(ticker: str, period: str = "1y", interval: str = "1d") -> str:
@@ -96,8 +129,7 @@ def get_historical_ohlcv(ticker: str, period: str = "1y", interval: str = "1d") 
     For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g., 'RELIANCE.NS'."""
     logger.info("Fetching OHLCV history for ticker='%s', period='%s'", ticker, period)
     try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period=period, interval=interval)
+        hist = _yf_get_history(ticker, period, interval)
         if hist.empty:
             return f"No price history found for {ticker}."
 
