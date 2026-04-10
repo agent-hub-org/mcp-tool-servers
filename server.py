@@ -344,6 +344,94 @@ def get_fii_dii_flows(days: int = 30) -> str:
         )
 
 
+# ── Financial Education Calculators ──────────────────────────
+
+@mcp.tool()
+def calculate_sip_returns(
+    monthly_investment: float,
+    annual_return_rate: float,
+    years: int,
+    inflation_rate: float = 6.0,
+) -> str:
+    """Calculate SIP maturity value and inflation-adjusted real value.
+    monthly_investment: INR per month (e.g. 5000)
+    annual_return_rate: expected annual return % (e.g. 12)
+    years: investment duration (e.g. 10)
+    inflation_rate: annual inflation % for real-value calc (default 6)"""
+    if monthly_investment <= 0 or annual_return_rate <= 0 or years <= 0:
+        return "All inputs must be positive numbers."
+    n = years * 12
+    r = (annual_return_rate / 100) / 12
+    maturity = monthly_investment * (((1 + r) ** n - 1) / r) * (1 + r)
+    invested = monthly_investment * n
+    real_value = maturity / ((1 + inflation_rate / 100) ** years)
+    return (
+        f"## SIP Calculator Result\n\n"
+        f"**Monthly SIP:** ₹{monthly_investment:,.0f} | "
+        f"**Duration:** {years} years | **Expected return:** {annual_return_rate}%\n\n"
+        f"| Metric | Value |\n|--------|-------|\n"
+        f"| Total Invested | ₹{invested:,.0f} |\n"
+        f"| Estimated Maturity Value | ₹{maturity:,.0f} |\n"
+        f"| Wealth Gained | ₹{maturity - invested:,.0f} |\n"
+        f"| Real Value (after {inflation_rate}% inflation) | ₹{real_value:,.0f} |\n\n"
+        f"*Estimates assume constant returns. Actual mutual fund returns vary.*"
+    )
+
+
+@mcp.tool()
+def calculate_goal_sip(
+    target_amount: float,
+    annual_return_rate: float,
+    years: int,
+) -> str:
+    """Reverse SIP calculator: monthly investment needed to reach a target amount.
+    target_amount: financial goal in INR (e.g. 1000000 for ₹10 lakh)
+    annual_return_rate: expected annual return % (e.g. 12)
+    years: time horizon in years (e.g. 10)"""
+    if target_amount <= 0 or annual_return_rate <= 0 or years <= 0:
+        return "All inputs must be positive numbers."
+    n = years * 12
+    r = (annual_return_rate / 100) / 12
+    fv_factor = (((1 + r) ** n - 1) / r) * (1 + r)
+    monthly = target_amount / fv_factor
+    return (
+        f"## Goal-Based SIP Calculator\n\n"
+        f"**Target:** ₹{target_amount:,.0f} in {years} years at {annual_return_rate}% returns\n\n"
+        f"| Metric | Value |\n|--------|-------|\n"
+        f"| Required Monthly SIP | ₹{monthly:,.0f} |\n"
+        f"| Total You'll Invest | ₹{monthly * n:,.0f} |\n"
+        f"| Market Will Add | ₹{target_amount - monthly * n:,.0f} |\n\n"
+        f"*Start a SIP with any AMFI-registered mutual fund to begin.*"
+    )
+
+
+@mcp.tool()
+def calculate_inflation_impact(
+    current_value: float,
+    inflation_rate: float,
+    years: int,
+) -> str:
+    """Show how inflation erodes purchasing power over time.
+    current_value: amount in INR today (e.g. 1000000 for ₹10 lakh)
+    inflation_rate: annual inflation % (e.g. 6)
+    years: number of years (e.g. 10)"""
+    if current_value <= 0 or inflation_rate <= 0 or years <= 0:
+        return "All inputs must be positive numbers."
+    future_cost = current_value * ((1 + inflation_rate / 100) ** years)
+    loss = future_cost - current_value
+    return (
+        f"## Inflation Impact Calculator\n\n"
+        f"**Today's Value:** ₹{current_value:,.0f} | "
+        f"**Inflation:** {inflation_rate}%/yr | **Years:** {years}\n\n"
+        f"| Metric | Value |\n|--------|-------|\n"
+        f"| Future Cost of Same Thing | ₹{future_cost:,.0f} |\n"
+        f"| Purchasing Power Eroded | ₹{loss:,.0f} ({loss / future_cost * 100:.1f}%) |\n\n"
+        f"This is why savings accounts (3-4% interest) lose to inflation. "
+        f"Investments must beat {inflation_rate}% to grow your real wealth.\n\n"
+        f"*India's CPI inflation historically averages 5-7%/year.*"
+    )
+
+
 # ── Vector DB Tools ───────────────────────────────────────────
 
 @mcp.tool()
