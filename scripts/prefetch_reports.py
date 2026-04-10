@@ -59,7 +59,7 @@ def _is_stale(last_fetched: str | None) -> bool:
     if last_fetched is None:
         return True
     try:
-        fetched_date = datetime.strptime(last_fetched, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        fetched_date = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         age_days = (datetime.now(timezone.utc) - fetched_date).days
         return age_days >= REFRESH_DAYS
     except ValueError:

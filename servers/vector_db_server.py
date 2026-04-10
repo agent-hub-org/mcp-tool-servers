@@ -50,14 +50,25 @@ def check_in_vector_db(identifier: str, index_name: str) -> str:
 @mcp.tool()
 def upsert_to_vector_db(data: str, metadata_json: str, index_name: str) -> str:
     """Upsert a document to the vector DB. data is the text content, metadata_json is a JSON string
-    of metadata fields, and index_name is the target Pinecone index."""
+    of metadata fields, and index_name is the target Pinecone index.
+
+    Args:
+        data: The text content of the document.
+        metadata_json: JSON string of metadata. Must be valid JSON.
+        index_name: Target Pinecone index name.
+    """
     logger.info("Upserting to vector DB — index='%s'", index_name)
     try:
         metadata = json.loads(metadata_json)
+        if not isinstance(metadata, dict):
+            return "Error: metadata_json must be a JSON object."
         db = _get_db(index_name)
         doc_id = metadata.get("doc_id", "doc")
         num_chunks = db.upsert_chunks(doc_id, data, metadata)
         return f"Successfully upserted {num_chunks} chunks to index '{index_name}'"
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error: %s", e)
+        return f"Invalid JSON in metadata_json: {e}"
     except Exception as e:
         logger.error("Error upserting to vector DB: %s", e)
         return f"Upsert failed: {e}"

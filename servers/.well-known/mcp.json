@@ -1,0 +1,13 @@
+{
+  "mcp_version": "2024-11-05",
+  "capabilities": {
+    "tools": {
+      "list": true
+    }
+  },
+  "servers": {
+    "web-search": "http://mcp-tool-servers:8010",
+    "finance-data": "http://mcp-tool-servers:8011",
+    "vector-db": "http://mcp-tool-servers:8012"
+  }
+}

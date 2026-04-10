@@ -46,7 +46,12 @@ def main():
         for name, proc in processes:
             ret = proc.poll()
             if ret is not None:
-                print(f"WARNING: {name} exited with code {ret}")
+                print(f"ERROR: {name} exited unexpectedly with code {ret}")
+                # Shut down remaining servers and exit
+                for other_name, other_proc in processes:
+                    if other_proc.poll() is None:
+                        other_proc.terminate()
+                sys.exit(1)
         try:
             signal.pause()
         except AttributeError:

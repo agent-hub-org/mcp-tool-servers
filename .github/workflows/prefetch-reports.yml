@@ -38,8 +38,8 @@ jobs:
       - name: Run pre-fetch script
         env:
           PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          AZURE_AI_FOUNDRY_ENDPOINT: ${{ secrets.AZURE_AI_FOUNDRY_ENDPOINT }}
+          AZURE_AI_FOUNDRY_API_KEY: ${{ secrets.AZURE_AI_FOUNDRY_API_KEY }}
         run: |
           ARGS=""
           if [ "${{ inputs.force }}" = "true" ]; then

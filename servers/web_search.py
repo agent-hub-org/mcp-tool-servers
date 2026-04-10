@@ -59,8 +59,15 @@ def tavily_quick_search(query: str, max_results: int = 3) -> str:
 @mcp.tool()
 def firecrawl_deep_scrape(url: str) -> str:
     """Deep scrape a specific URL to extract its full markdown content.
-    Use when you need to read a long-form article, report, or earnings transcript."""
+    Use when you need to read a long-form article, report, or earnings transcript.
+
+    Args:
+        url: The full HTTPS URL to scrape. Must be a valid web address.
+    """
     logger.info("Firecrawl scraping — url='%s'", url)
+    if not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL. Please provide a URL starting with http:// or https://"
+
     try:
         app = _get_firecrawl()
         scrape_result = app.scrape(url, formats=["markdown"])

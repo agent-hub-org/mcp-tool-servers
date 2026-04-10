@@ -105,7 +105,13 @@ def tavily_quick_search(query: str, max_results: int = 3) -> str:
 @mcp.tool()
 def firecrawl_deep_scrape(url: str) -> str:
     """Deep scrape a specific URL to extract its full markdown content.
-    Use when you need to read a long-form article, report, or earnings transcript."""
+    Use when you need to read a long-form article, report, or earnings transcript.
+
+    Args:
+        url: The full HTTP(S) URL to scrape. Must be a valid web address.
+    """
+    if not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL. Please provide a URL starting with http:// or https://"
     logger.info("Firecrawl scraping — url='%s'", url)
     try:
         app = _get_firecrawl()
@@ -120,6 +126,92 @@ def firecrawl_deep_scrape(url: str) -> str:
 
 
 # ── Finance Data Tools ────────────────────────────────────────
+
+# ── Indian ticker alias table ──────────────────────────────────
+_INDIAN_TICKER_ALIASES: dict[str, str] = {
+    "sbi": "SBIN", "state bank": "SBIN", "state bank of india": "SBIN", "sbin": "SBIN",
+    "pnb": "PNB", "punjab national bank": "PNB",
+    "bob": "BANKBARODA", "bank of baroda": "BANKBARODA", "bankbaroda": "BANKBARODA",
+    "boi": "BANKINDIA", "bank of india": "BANKINDIA", "bankindia": "BANKINDIA",
+    "ubi": "UNIONBANK", "union bank": "UNIONBANK", "union bank of india": "UNIONBANK", "unionbank": "UNIONBANK",
+    "canara": "CANBK", "canara bank": "CANBK", "canbk": "CANBK",
+    "hdfc bank": "HDFCBANK", "hdfcbank": "HDFCBANK", "hdfc": "HDFCBANK",
+    "icici bank": "ICICIBANK", "icicibank": "ICICIBANK", "icici": "ICICIBANK",
+    "axis bank": "AXISBANK", "axisbank": "AXISBANK", "axis": "AXISBANK",
+    "kotak": "KOTAKBANK", "kotak bank": "KOTAKBANK", "kotakbank": "KOTAKBANK",
+    "reliance": "RELIANCE", "ril": "RELIANCE", "reliance industries": "RELIANCE",
+    "itc": "ITC",
+    "tcs": "TCS", "tata consultancy": "TCS", "tata consultancy services": "TCS",
+    "infy": "INFY", "infosys": "INFY",
+    "wipro": "WIPRO",
+    "hcl": "HCLTECH", "hcl tech": "HCLTECH", "hcltech": "HCLTECH", "hcl technologies": "HCLTECH",
+    "bajaj finance": "BAJFINANCE", "bajfinance": "BAJFINANCE",
+    "l&t": "LT", "lt": "LT", "larsen": "LT", "larsen and toubro": "LT",
+    "maruti": "MARUTI", "maruti suzuki": "MARUTI",
+    "tata motors": "TATAMOTORS", "tatamotors": "TATAMOTORS",
+    "sun pharma": "SUNPHARMA", "sunpharma": "SUNPHARMA",
+    "asian paints": "ASIANPAINT", "asianpaint": "ASIANPAINT",
+}
+
+
+@mcp.tool()
+def resolve_indian_ticker(company_name_or_symbol: str) -> str:
+    """Resolve an Indian company name, abbreviation, or partial symbol to the correct
+    NSE ticker (with .NS suffix) for use with all other finance tools.
+
+    Call this BEFORE get_ticker_data, get_bse_nse_reports, or get_historical_ohlcv
+    whenever the user provides a company name or abbreviation rather than an explicit
+    NSE/BSE ticker like 'RELIANCE.NS'.
+
+    Returns a single line: "<NSE_TICKER>  (<confirmed company name>)"
+    On failure returns an error string explaining what was tried."""
+    logger.info("resolve_indian_ticker called with input='%s'", company_name_or_symbol)
+
+    normalized = company_name_or_symbol.lower().strip()
+    if normalized.endswith(".ns"):
+        normalized = normalized[:-3]
+    elif normalized.endswith(".bo"):
+        normalized = normalized[:-3]
+
+    if normalized in _INDIAN_TICKER_ALIASES:
+        nse_symbol = _INDIAN_TICKER_ALIASES[normalized]
+        ticker_with_suffix = f"{nse_symbol}.NS"
+        logger.info("Alias table hit: '%s' → '%s'", company_name_or_symbol, ticker_with_suffix)
+        try:
+            name = yf.Ticker(ticker_with_suffix).fast_info.display_name or ticker_with_suffix
+        except Exception:
+            name = ticker_with_suffix
+        return f"{ticker_with_suffix}  ({name})"
+
+    logger.info("Alias miss for '%s', falling back to yf.Search", company_name_or_symbol)
+    try:
+        results = yf.Search(
+            company_name_or_symbol,
+            max_results=10,
+            news_count=0,
+            lists_count=0,
+        )
+        indian_quotes = [
+            q for q in results.quotes
+            if q.get("symbol", "").endswith((".NS", ".BO"))
+        ]
+        if indian_quotes:
+            best = indian_quotes[0]
+            symbol = best["symbol"]
+            name = best.get("shortname") or best.get("longname") or symbol
+            logger.info("yf.Search resolved '%s' → '%s' (%s)", company_name_or_symbol, symbol, name)
+            return f"{symbol}  ({name})"
+
+        return (
+            f"Could not resolve '{company_name_or_symbol}' to an Indian ticker. "
+            "Try the explicit NSE symbol directly (e.g. 'SBIN.NS')."
+        )
+    except Exception as e:
+        logger.error("yf.Search failed for '%s': %s", company_name_or_symbol, e)
+        return (
+            f"Ticker resolution failed for '{company_name_or_symbol}': {e}. "
+            "Try the explicit NSE symbol directly."
+        )
 
 @mcp.tool()
 def get_ticker_data(ticker: str) -> str:
@@ -177,20 +269,21 @@ def get_bse_nse_reports(ticker: str) -> str:
 
 
 @mcp.tool()
-def get_historical_ohlcv(ticker: str, period: str = "1y", interval: str = "1d") -> str:
+def get_historical_ohlcv(ticker: str, period: str = "1y", interval: str = "1d", end_date: str | None = None) -> str:
     """Get price history summary and trend analysis for a ticker symbol.
     Returns multi-timeframe returns, monthly price series, moving averages, and volume.
     period options: 1mo, 3mo, 6mo, 1y, 2y, 5y
     interval options: 1d, 1wk, 1mo
+    end_date: optional ISO date string (e.g. '2026-02-02') to cap history at a specific date
     For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g., 'RELIANCE.NS'."""
     if period not in _VALID_YFINANCE_PERIODS:
         return f"Invalid period '{period}'. Valid options: {sorted(_VALID_YFINANCE_PERIODS)}"
     if interval not in _VALID_YFINANCE_INTERVALS:
         return f"Invalid interval '{interval}'. Valid options: {sorted(_VALID_YFINANCE_INTERVALS)}"
-    logger.info("Fetching OHLCV history for ticker='%s', period='%s'", ticker, period)
+    logger.info("Fetching OHLCV history for ticker='%s', period='%s', end_date=%s", ticker, period, end_date)
     try:
         t = yf.Ticker(ticker)
-        hist = t.history(period=period, interval=interval)
+        hist = t.history(period=period, interval=interval, end=end_date)
         if hist.empty:
             return f"No price history found for {ticker}."
 
@@ -265,12 +358,14 @@ def get_macro_indicators() -> str:
     lines = ["## Indian & Global Macro Indicators",
              "*(For RBI repo rate / CPI / IIP use tavily_quick_search)*", ""]
     fetched = 0
+    failed: list[str] = []
     for symbol, label in indicators:
         try:
             info = yf.Ticker(symbol).fast_info
             price = info.last_price
             prev = info.previous_close
             if price is None:
+                failed.append(label)
                 continue
             if prev and prev != 0:
                 chg = ((price - prev) / prev) * 100
@@ -281,9 +376,13 @@ def get_macro_indicators() -> str:
             fetched += 1
         except Exception as e:
             logger.warning("Skipping %s (%s): %s", symbol, label, e)
+            failed.append(label)
 
     if fetched == 0:
         return "Failed to fetch macro indicators. Use tavily_quick_search for current data."
+
+    if failed:
+        lines.append(f"\n**Unavailable:** {', '.join(failed)} — use tavily_quick_search for these.")
 
     result = "\n".join(lines)
     _macro_cache[cache_key] = (now, result)
@@ -295,7 +394,13 @@ def get_fii_dii_flows(days: int = 30) -> str:
     """Fetch FII/DII equity trading activity from NSE India for the last N trading days.
     Returns gross buy, gross sell, and net investment values in crores INR.
     FII (Foreign Institutional Investors) and DII (Domestic Institutional Investors) flows
-    are a key indicator of institutional sentiment in Indian equity markets."""
+    are a key indicator of institutional sentiment in Indian equity markets.
+
+    Args:
+        days: Number of trading days to fetch (default 30). Must be a positive integer.
+    """
+    if not isinstance(days, int) or days <= 0:
+        return "Error: 'days' must be a positive integer."
     logger.info("Fetching FII/DII flows for last %d days", days)
     try:
         session = requests.Session()

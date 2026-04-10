@@ -436,7 +436,14 @@ def get_fii_dii_flows(days: int = 30) -> str:
     """Fetch FII/DII equity trading activity from NSE India for the last N trading days.
     Returns gross buy, gross sell, and net investment values in crores INR.
     FII (Foreign Institutional Investors) and DII (Domestic Institutional Investors) flows
-    are a key indicator of institutional sentiment in Indian equity markets."""
+    are a key indicator of institutional sentiment in Indian equity markets.
+
+    Args:
+        days: Number of trading days to fetch (default 30). Must be a positive integer.
+    """
+    if not isinstance(days, int) or days <= 0:
+        return "Error: 'days' must be a positive integer."
+
     logger.info("Fetching FII/DII flows for last %d days", days)
     try:
         session = requests.Session()

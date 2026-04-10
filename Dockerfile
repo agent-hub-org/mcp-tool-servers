@@ -12,9 +12,6 @@ RUN poetry config virtualenvs.in-project true && \
 FROM python:3.13-slim
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
-    && rm -rf /var/lib/apt/lists/*
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV="/app/.venv" \
