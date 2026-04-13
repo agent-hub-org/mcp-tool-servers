@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import arxiv
@@ -925,24 +926,38 @@ def fetch_github_repo(repo_url: str, max_files: int = 40) -> str:
         ]
         all_blobs.sort(key=lambda f: (-_gh_file_priority(f["path"]), len(f["path"])))
 
-        key_files: list[dict[str, str]] = []
-        for item in all_blobs[:max_files]:
+        def _fetch_file(item: dict) -> dict | None:
+            """Fetch a single file from GitHub. Returns {path, content} or None on failure."""
             try:
                 cr = requests.get(
                     f"https://api.github.com/repos/{repo_full}/contents/{item['path']}",
                     headers=_GH_HEADERS, timeout=_GH_TIMEOUT,
                 )
                 if not cr.ok:
-                    continue
+                    return None
                 fj = cr.json()
                 if fj.get("encoding") != "base64":
-                    continue
+                    return None
                 raw = base64.b64decode(fj["content"]).decode("utf-8", errors="replace")
                 if len(raw) > _GH_MAX_BYTES:
                     raw = raw[:_GH_MAX_BYTES] + f"\n\n... [truncated at {_GH_MAX_BYTES} bytes]"
-                key_files.append({"path": item["path"], "content": raw})
+                return {"path": item["path"], "content": raw}
             except Exception as exc:
                 logger.warning("Skipping %s: %s", item["path"], exc)
+                return None
+
+        targets = all_blobs[:max_files]
+        key_files: list[dict[str, str]] = []
+        # Fetch files concurrently — up to 10 parallel GitHub API calls
+        with ThreadPoolExecutor(max_workers=min(10, len(targets))) as executor:
+            futures = {executor.submit(_fetch_file, item): item for item in targets}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    key_files.append(result)
+        # Restore priority order (parallel execution loses original sort order)
+        path_order = {item["path"]: idx for idx, item in enumerate(targets)}
+        key_files.sort(key=lambda f: path_order.get(f["path"], 999))
 
         all_paths = [item["path"] for item in all_blobs[:200]]
         language = meta.get("language") or "unknown"
@@ -981,6 +996,18 @@ def fetch_github_repo(repo_url: str, max_files: int = 40) -> str:
         return f"Error: Unexpected failure fetching {repo_full}: {exc}"
 
 
+# Expose the ASGI app so uvicorn can import it directly (enables --workers).
+# Each worker handles independent tool-call HTTP requests so no shared session
+# state is needed — multi-worker is safe for the streamable-http transport.
+app = mcp.get_streamable_http_app()
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.getenv("PORT", 8010))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    workers = int(os.getenv("WEB_CONCURRENCY", 1))
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=port,
+        workers=workers,
+    )
