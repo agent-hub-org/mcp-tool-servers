@@ -999,7 +999,7 @@ def fetch_github_repo(repo_url: str, max_files: int = 40) -> str:
 # Expose the ASGI app so uvicorn can import it directly (enables --workers).
 # Each worker handles independent tool-call HTTP requests so no shared session
 # state is needed — multi-worker is safe for the streamable-http transport.
-app = mcp.get_streamable_http_app()
+app = mcp.http_app()
 
 if __name__ == "__main__":
     import uvicorn
