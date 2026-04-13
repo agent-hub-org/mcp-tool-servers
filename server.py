@@ -998,21 +998,31 @@ def fetch_github_repo(repo_url: str, max_files: int = 40) -> str:
 
 # Factory function required for uvicorn multi-worker mode.
 # Each worker calls create_app() after forking, which creates a fresh
-# StreamableHTTPSessionManager per worker. Sharing a single app instance
-# (module-level) across forked workers causes the second worker to hit
-# StreamableHTTPSessionManager's "can only be called once" guard and exit cleanly.
+# StreamableHTTPSessionManager per worker. stateless_http=True avoids session
+# tracking (correct for tool servers — each tool call is independent) and removes
+# the anyio.Lock() instances from StreamableHTTPSessionManager that can fail when
+# inherited across fork boundaries (mcp 1.27.0+).
 def create_app():
-    return mcp.http_app()
+    try:
+        return mcp.http_app(stateless_http=True)
+    except Exception:
+        logger.critical("create_app() failed in worker", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8010))
     workers = int(os.getenv("WEB_CONCURRENCY", 1))
-    uvicorn.run(
-        "server:create_app",
-        factory=True,
-        host="0.0.0.0",
-        port=port,
-        workers=workers,
-    )
+    if workers > 1:
+        uvicorn.run(
+            "server:create_app",
+            factory=True,
+            host="0.0.0.0",
+            port=port,
+            workers=workers,
+        )
+    else:
+        # Run in-process (no fork) so asyncio primitives created at module level
+        # bind to the same event loop uvicorn creates — no fork-safety issues.
+        uvicorn.run(mcp.http_app(stateless_http=True), host="0.0.0.0", port=port)
