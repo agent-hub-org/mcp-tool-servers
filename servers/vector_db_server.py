@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 import arxiv
@@ -21,10 +22,22 @@ logger = logging.getLogger("mcp_tool_servers.vector_db_server")
 mcp = FastMCP("vector-db", instructions="Vector database tools for storing and retrieving documents.")
 
 _arxiv_client = arxiv.Client()
+_cohere_client = None
 
 
 def _get_db(index_name: str) -> VectorDB:
     return VectorDB(index_name=index_name)
+
+
+def _get_cohere():
+    global _cohere_client
+    if _cohere_client is None:
+        import cohere
+        _cohere_client = cohere.Client(
+            api_key=os.environ["AZURE_COHERE_API_KEY"],
+            base_url=os.environ["AZURE_COHERE_ENDPOINT"],
+        )
+    return _cohere_client
 
 
 # ---- Generic vector DB operations ----
@@ -191,6 +204,57 @@ def retrieve_papers(query: str, top_k: int = 5) -> str:
         return f"Retrieval failed: {e}"
 
 
+@mcp.tool()
+def hybrid_retrieve_papers(query: str, top_k: int = 10) -> str:
+    """Hybrid retrieval: semantic top-k from vector DB → Cohere cross-encoder rerank → top-2.
+    Returns chunks with relevance scores and a 'high_confidence' flag.
+    If high_confidence is false, supplement with download_and_store_arxiv_papers and/or
+    tavily_quick_search before synthesizing your answer."""
+    logger.info("hybrid_retrieve_papers — query='%s', top_k=%d", query[:80], top_k)
+    try:
+        db = _get_db("research-papers")
+        results = db.retrieve(query, top_k=top_k)
+        if not results:
+            return "high_confidence: false\nNo papers found in vector DB for this query."
+
+        # Build document strings for Cohere reranker
+        docs = [r.get("text", "") for r in results]
+        co = _get_cohere()
+        rerank_response = co.rerank(
+            model="rerank-v4.0-fast",
+            query=query,
+            documents=docs,
+            top_n=2,
+            return_documents=True,
+        )
+
+        top_results = rerank_response.results
+        if not top_results:
+            return "high_confidence: false\nReranker returned no results."
+
+        high_confidence = top_results[0].relevance_score >= 0.80
+        confidence_line = f"high_confidence: {str(high_confidence).lower()}"
+        logger.info(
+            "hybrid_retrieve_papers: top score=%.3f, high_confidence=%s",
+            top_results[0].relevance_score, high_confidence,
+        )
+
+        chunks = []
+        for rr in top_results:
+            original = results[rr.index]
+            title = original.get("title", "Unknown")
+            authors = original.get("authors", "")
+            chunks.append(
+                f"**{title}** by {authors} (rerank_score: {rr.relevance_score:.3f})\n"
+                f"{rr.document.text}"
+            )
+
+        return confidence_line + "\n\n" + "\n\n---\n\n".join(chunks)
+    except Exception as e:
+        logger.error("hybrid_retrieve_papers error: %s", e)
+        return f"high_confidence: false\nRetrieval failed: {e}"
+
+
 def _rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[dict]:
     """Rerank arxiv candidates by embedding similarity to the query.
 
@@ -344,6 +408,53 @@ async def download_and_store_arxiv_papers(query: str, max_results: int = 5,
     except Exception as e:
         logger.error("Error downloading arXiv papers: %s", e)
         return f"Failed to download papers: {e}"
+
+
+# ---- Semantic (user-knowledge) memory tools ----
+
+_user_knowledge_db = None
+
+
+def _get_user_knowledge_db():
+    global _user_knowledge_db
+    if _user_knowledge_db is None:
+        from shared.vector_db import UserKnowledgeDB
+        _user_knowledge_db = UserKnowledgeDB()
+    return _user_knowledge_db
+
+
+@mcp.tool()
+def retrieve_user_knowledge(user_id: str, query: str, top_k: int = 5) -> str:
+    """Retrieve semantic memory facts for a user from the user-knowledge index.
+    Returns durable facts extracted from past sessions (preferences, risk profile, interests, etc.)."""
+    logger.info("retrieve_user_knowledge — user_id='%s', query='%s'", user_id[:20], query[:60])
+    try:
+        db = _get_user_knowledge_db()
+        facts = db.retrieve(user_id, query, top_k)
+        if not facts:
+            return "No semantic memories found for this user."
+        return "\n".join(f"• {f['fact']} (score: {f['score']:.3f})" for f in facts)
+    except Exception as e:
+        logger.error("retrieve_user_knowledge error: %s", e)
+        return f"Semantic memory retrieval failed: {e}"
+
+
+@mcp.tool()
+def upsert_user_knowledge(user_id: str, facts_json: str) -> str:
+    """Upsert a list of durable semantic facts for a user.
+    facts_json must be a JSON array of strings (e.g. '[\"risk-conservative investor\"]').
+    Deduplication is applied — near-duplicate facts are skipped."""
+    logger.info("upsert_user_knowledge — user_id='%s'", user_id[:20])
+    try:
+        facts = json.loads(facts_json)
+        if not isinstance(facts, list):
+            return "Error: facts_json must be a JSON array of strings."
+        db = _get_user_knowledge_db()
+        n = db.upsert_facts(user_id, [str(f) for f in facts if f])
+        return f"Upserted {n} new facts (duplicates skipped)."
+    except Exception as e:
+        logger.error("upsert_user_knowledge error: %s", e)
+        return f"Semantic memory upsert failed: {e}"
 
 
 if __name__ == "__main__":

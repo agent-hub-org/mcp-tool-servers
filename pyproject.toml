@@ -24,6 +24,7 @@ dependencies = [
     "cachetools (>=5.5.0,<6.0.0)",
     "requests (>=2.32.0,<3.0.0)",
     "httpx (>=0.28.0,<1.0.0)",
+    "cohere (>=5.0.0,<6.0.0)",
 ]
 
 [build-system]

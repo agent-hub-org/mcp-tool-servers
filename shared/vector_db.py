@@ -248,3 +248,71 @@ class VectorDB:
             include_metadata=False,
         )
         return bool(results.matches) and results.matches[0].score >= _EXIST_THRESHOLD
+
+
+class UserKnowledgeDB:
+    """Semantic memory store: durable user facts extracted from sessions.
+    Uses a dedicated 'user-knowledge' Pinecone index with user_id metadata filtering."""
+
+    _DIMENSIONS = {"azure": 3072}
+    _DEDUP_THRESHOLD = 0.88  # skip upsert if a similar fact already exists
+
+    def __init__(self):
+        self.pinecone = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+        self.embeddings = OpenAIEmbeddings(
+            base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
+            api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
+            model="text-embedding-3-large",
+        )
+        self._ensure_index()
+
+    def _ensure_index(self):
+        existing = {idx.name for idx in self.pinecone.list_indexes()}
+        if "user-knowledge" not in existing:
+            self.pinecone.create_index(
+                name="user-knowledge",
+                dimension=self._DIMENSIONS["azure"],
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
+            logger.info("Created Pinecone index 'user-knowledge'")
+        self.index = self.pinecone.Index("user-knowledge")
+
+    def retrieve(self, user_id: str, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """Retrieve semantic memory facts for a user matching the query."""
+        vec = self.embeddings.embed_query(query)
+        results = self.index.query(
+            vector=vec,
+            top_k=top_k,
+            filter={"user_id": {"$eq": user_id}},
+            include_metadata=True,
+        )
+        return [
+            {"fact": m.metadata.get("fact", ""), "score": m.score}
+            for m in results.matches
+        ]
+
+    def upsert_facts(self, user_id: str, facts: list[str]) -> int:
+        """Upsert facts with deduplication. Returns number of new facts inserted."""
+        import uuid
+        upserted = 0
+        for fact in facts:
+            vec = self.embeddings.embed_query(fact)
+            # Check for near-duplicate before upserting
+            existing = self.index.query(
+                vector=vec,
+                top_k=1,
+                filter={"user_id": {"$eq": user_id}},
+                include_metadata=True,
+            )
+            if existing.matches and existing.matches[0].score >= self._DEDUP_THRESHOLD:
+                logger.debug("Skipping duplicate semantic fact for user=%s: %.60s", user_id, fact)
+                continue
+            self.index.upsert(vectors=[{
+                "id": f"{user_id}_{uuid.uuid4().hex[:12]}",
+                "values": vec,
+                "metadata": {"user_id": user_id, "fact": fact},
+            }])
+            upserted += 1
+        logger.info("Upserted %d new semantic facts for user=%s", upserted, user_id)
+        return upserted
