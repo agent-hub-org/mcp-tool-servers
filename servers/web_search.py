@@ -148,6 +148,86 @@ def firecrawl_deep_scrape(url: str) -> str:
         return f"Scrape failed for {url}: {e}"
 
 
+@mcp.tool()
+def search_pubmed(query: str, max_results: int = 5) -> str:
+    """Search PubMed for peer-reviewed biomedical and health science literature.
+
+    Returns article titles, authors, publication date, abstract, and PMID.
+    Use for evidence-based health, nutrition, exercise science, and clinical questions.
+    Prefer this over Tavily when you need peer-reviewed sources with PMIDs.
+
+    Args:
+        query: The search query (e.g. "progressive overload muscle hypertrophy",
+               "intermittent fasting metabolic effects", "ACL rehabilitation protocol").
+        max_results: Number of results to return (1-10, default 5).
+    """
+    import urllib.request
+    import urllib.parse
+    import json as _json
+
+    max_results = max(1, min(max_results, 10))
+    logger.info("PubMed search — query='%s', max=%d", query, max_results)
+
+    try:
+        # Step 1: esearch to get PMIDs
+        search_params = urllib.parse.urlencode({
+            "db": "pubmed",
+            "term": query,
+            "retmax": max_results,
+            "retmode": "json",
+            "sort": "relevance",
+        })
+        search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?{search_params}"
+        with urllib.request.urlopen(search_url, timeout=10) as resp:
+            search_data = _json.loads(resp.read().decode())
+
+        pmids = search_data.get("esearchresult", {}).get("idlist", [])
+        if not pmids:
+            return f"No PubMed articles found for: {query}"
+
+        # Step 2: efetch to get abstracts
+        fetch_params = urllib.parse.urlencode({
+            "db": "pubmed",
+            "id": ",".join(pmids),
+            "retmode": "json",
+            "rettype": "abstract",
+        })
+        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?{fetch_params}"
+
+        # Use esummary for structured data
+        summary_params = urllib.parse.urlencode({
+            "db": "pubmed",
+            "id": ",".join(pmids),
+            "retmode": "json",
+        })
+        summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?{summary_params}"
+        with urllib.request.urlopen(summary_url, timeout=10) as resp:
+            summary_data = _json.loads(resp.read().decode())
+
+        results = []
+        uids = summary_data.get("result", {}).get("uids", [])
+        for uid in uids:
+            article = summary_data["result"].get(uid, {})
+            title = article.get("title", "No title")
+            authors = ", ".join(a.get("name", "") for a in article.get("authors", [])[:3])
+            if len(article.get("authors", [])) > 3:
+                authors += " et al."
+            pub_date = article.get("pubdate", "")
+            source = article.get("source", "")
+            results.append(
+                f"**{title}**\n"
+                f"Authors: {authors}\n"
+                f"Journal: {source} ({pub_date})\n"
+                f"PMID: {uid} — https://pubmed.ncbi.nlm.nih.gov/{uid}/"
+            )
+
+        return f"## PubMed Results for: {query}\n\n" + "\n\n---\n\n".join(results)
+
+    except Exception as e:
+        logger.error("PubMed search error: %s", e)
+        return f"PubMed search failed: {e}. Try tavily_quick_search as fallback."
+
+
 if __name__ == "__main__":
     from shared.config import PORTS
     mcp.run(transport="streamable-http", host="0.0.0.0", port=PORTS["web-search"])

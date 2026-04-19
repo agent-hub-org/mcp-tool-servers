@@ -1,9 +1,11 @@
 """MCP server for finance data tools (yfinance + BSE/NSE reports). Port 8011."""
 
+import json
 import logging
 import time
 
 import httpx
+import requests
 import yfinance as yf
 from cachetools import cached, TTLCache
 from dotenv import load_dotenv
@@ -787,6 +789,150 @@ def get_regime_inputs() -> str:
     }
     if warnings:
         result["warnings"] = warnings
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@cached(cache=TTLCache(maxsize=200, ttl=3600))
+def get_earnings_calendar(ticker: str) -> str:
+    """Return the next earnings date and key financial calendar events for a ticker.
+
+    Returns upcoming earnings date, dividend date, ex-dividend date, and analyst
+    estimates (EPS and revenue) where available from yfinance.
+    For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g. 'HDFCBANK.NS'.
+    """
+    import json
+
+    logger.info("get_earnings_calendar called for ticker='%s'", ticker)
+    try:
+        t = yf.Ticker(ticker)
+        info = _yf_get_info(ticker)
+
+        result: dict = {"ticker": ticker}
+
+        # Earnings dates from calendar
+        try:
+            cal = t.calendar
+            if cal is not None and not cal.empty:
+                if "Earnings Date" in cal.index:
+                    dates = cal.loc["Earnings Date"]
+                    result["earnings_dates"] = [str(d)[:10] for d in (dates if hasattr(dates, "__iter__") else [dates])]
+                if "Earnings Average" in cal.index:
+                    result["eps_estimate"] = float(cal.loc["Earnings Average"]) if cal.loc["Earnings Average"] is not None else None
+                if "Revenue Average" in cal.index:
+                    rev = cal.loc["Revenue Average"]
+                    result["revenue_estimate_cr"] = round(float(rev) / 1e7, 2) if rev else None
+        except Exception:
+            pass
+
+        # Dividend info
+        ex_div = info.get("exDividendDate")
+        if ex_div:
+            from datetime import datetime as _dt
+            result["ex_dividend_date"] = _dt.fromtimestamp(ex_div).strftime("%Y-%m-%d")
+        div_rate = info.get("dividendRate")
+        if div_rate:
+            result["annual_dividend"] = round(float(div_rate), 2)
+        div_yield = info.get("dividendYield")
+        if div_yield:
+            result["dividend_yield_pct"] = round(float(div_yield) * 100, 2)
+
+        # Last reported quarter
+        fiscal_ye = info.get("fiscalYearEnd")
+        if fiscal_ye:
+            result["fiscal_year_end_month"] = fiscal_ye
+
+        if len(result) == 1:
+            result["note"] = "No earnings calendar data available. Try tavily_quick_search for upcoming results."
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.error("get_earnings_calendar failed for '%s': %s", ticker, e)
+        return json.dumps({"error": f"Failed to fetch earnings calendar for {ticker}: {e}"})
+
+
+@mcp.tool()
+def run_scenario_simulation(
+    ticker: str,
+    scenario: str,
+    base_price: float,
+    shock_pct: float,
+    current_sip_monthly: float = 0.0,
+    holding_period_years: float = 1.0,
+) -> str:
+    """Simulate the impact of a market scenario on a stock price and SIP portfolio.
+
+    Args:
+        ticker: The ticker symbol (e.g. 'NIFTYBEES.NS', 'RELIANCE.NS').
+        scenario: Plain-English description of the scenario (e.g. 'Nifty falls 20% in a bear market').
+        base_price: Current price of the ticker (use get_ticker_data to fetch it first).
+        shock_pct: Price change in percent, e.g. -20.0 for a 20% fall, +15.0 for a 15% rally.
+        current_sip_monthly: Optional monthly SIP amount in INR. 0 if not applicable.
+        holding_period_years: How many years to project the scenario over.
+    """
+    import json
+    import math
+
+    logger.info("run_scenario_simulation: ticker='%s', shock=%.1f%%, sip=%.0f, years=%.1f",
+                ticker, shock_pct, current_sip_monthly, holding_period_years)
+
+    shock = shock_pct / 100.0
+    shocked_price = round(base_price * (1 + shock), 2)
+    price_delta = round(shocked_price - base_price, 2)
+
+    result: dict = {
+        "scenario": scenario,
+        "ticker": ticker,
+        "base_price": base_price,
+        "shocked_price": shocked_price,
+        "price_change": price_delta,
+        "price_change_pct": shock_pct,
+    }
+
+    # Portfolio impact for a single-stock holding
+    result["impact_per_unit"] = f"{'Loss' if shock < 0 else 'Gain'} of Rs.{abs(price_delta):.2f} per share"
+    result["impact_on_1L_holding"] = f"Rs.{round(100000 * shock, 2):,.2f} ({'loss' if shock < 0 else 'gain'}) on a Rs.1,00,000 position"
+
+    # SIP scenario — rupee cost averaging effect
+    if current_sip_monthly > 0 and holding_period_years > 0:
+        months = int(holding_period_years * 12)
+        total_invested = current_sip_monthly * months
+
+        # Linear price trajectory from base to shocked price over the period
+        prices = [base_price + (shocked_price - base_price) * (i / max(months - 1, 1)) for i in range(months)]
+        units_accumulated = sum(current_sip_monthly / p for p in prices)
+        final_value = units_accumulated * shocked_price
+        xirr_approx = (final_value / total_invested) ** (1 / holding_period_years) - 1
+
+        result["sip_analysis"] = {
+            "monthly_sip": current_sip_monthly,
+            "holding_period_years": holding_period_years,
+            "total_invested": round(total_invested, 2),
+            "units_accumulated": round(units_accumulated, 4),
+            "final_value": round(final_value, 2),
+            "absolute_pnl": round(final_value - total_invested, 2),
+            "approx_cagr_pct": round(xirr_approx * 100, 2),
+            "rupee_cost_avg_price": round(total_invested / units_accumulated, 2),
+            "note": (
+                "Rupee-cost averaging softens the impact vs lump-sum. "
+                "Early months buy more units at lower prices in a bear scenario."
+                if shock < 0 else
+                "In a bull scenario, early SIP months buy fewer units at lower prices — "
+                "later months are more expensive."
+            ),
+        }
+
+    result["key_takeaway"] = (
+        f"In this '{scenario}' scenario, {ticker} drops to Rs.{shocked_price:,.2f} "
+        f"({shock_pct:+.1f}%). "
+        + (f"A monthly SIP of Rs.{current_sip_monthly:,.0f} over {holding_period_years:.0f}y "
+           f"would accumulate {result['sip_analysis']['units_accumulated']:.2f} units "
+           f"worth Rs.{result['sip_analysis']['final_value']:,.2f} "
+           f"(approx. {result['sip_analysis']['approx_cagr_pct']:+.1f}% CAGR)."
+           if current_sip_monthly > 0 else "")
+    )
 
     return json.dumps(result, indent=2)
 
