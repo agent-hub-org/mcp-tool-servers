@@ -23,6 +23,8 @@ mcp = FastMCP("vector-db", instructions="Vector database tools for storing and r
 
 _arxiv_client = arxiv.Client()
 _cohere_client = None
+_PAPERS_DIR = Path(os.getenv("PAPERS_DIR", str(Path(__file__).resolve().parent.parent / "papers")))
+_RERANK_MODEL = os.getenv("RERANK_MODEL", "rerank-v4.0-fast")
 
 
 def _get_db(index_name: str) -> VectorDB:
@@ -221,7 +223,7 @@ def hybrid_retrieve_papers(query: str, top_k: int = 10) -> str:
         docs = [r.get("text", "") for r in results]
         co = _get_cohere()
         rerank_response = co.rerank(
-            model="rerank-v4.0-fast",
+            model=_RERANK_MODEL,
             query=query,
             documents=docs,
             top_n=2,
@@ -253,47 +255,6 @@ def hybrid_retrieve_papers(query: str, top_k: int = 10) -> str:
     except Exception as e:
         logger.error("hybrid_retrieve_papers error: %s", e)
         return f"high_confidence: false\nRetrieval failed: {e}"
-
-
-def _rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[dict]:
-    """Rerank arxiv candidates by embedding similarity to the query.
-
-    Each candidate dict must have 'title' and 'summary' keys.
-    Returns the top_n most relevant candidates sorted by cosine similarity.
-    """
-    if len(candidates) <= top_n:
-        return candidates
-
-    db = _get_db("research-papers")
-
-    # Build a text representation for each candidate
-    candidate_texts = [
-        f"{c['title']}. {c['summary']}" for c in candidates
-    ]
-
-    # Embed query and all candidates in one batch
-    query_vector = db.embeddings.embed_query(query)
-    candidate_vectors = db.embeddings.embed_documents(candidate_texts)
-
-    # Compute cosine similarity (vectors are already normalized by most embedding models)
-    similarities = []
-    for i, cvec in enumerate(candidate_vectors):
-        dot = sum(q * c for q, c in zip(query_vector, cvec))
-        similarities.append((i, dot))
-
-    # Sort by similarity descending, take top_n
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    reranked = []
-    for idx, score in similarities[:top_n]:
-        candidates[idx]["_relevance_score"] = round(score, 4)
-        reranked.append(candidates[idx])
-
-    logger.info("Reranked %d candidates → top %d (scores: %.3f – %.3f)",
-                len(candidates), len(reranked),
-                reranked[0].get("_relevance_score", 0),
-                reranked[-1].get("_relevance_score", 0))
-
-    return reranked
 
 
 @mcp.tool()
@@ -359,11 +320,12 @@ async def download_and_store_arxiv_papers(query: str, max_results: int = 5,
                      len(candidates), max_results)
 
         # Rerank by embedding similarity — only keep the most relevant papers
-        top_candidates = _rerank_candidates(query, candidates, max_results)
+        db = _get_db("research-papers")
+        top_candidates = db.rerank_candidates(query, candidates, max_results)
 
         # Download PDFs in parallel — use cached paper objects, no per-paper re-fetch
-        download_dir = Path("papers")
-        download_dir.mkdir(exist_ok=True)
+        download_dir = _PAPERS_DIR
+        download_dir.mkdir(parents=True, exist_ok=True)
 
         async def _download_one(candidate: dict) -> dict | None:
             short_id = candidate["short_id"]
@@ -392,7 +354,6 @@ async def download_and_store_arxiv_papers(query: str, max_results: int = 5,
         if not papers:
             return "No papers could be downloaded."
 
-        db = _get_db("research-papers")
         await db.upsert_papers(papers)
 
         summaries = []

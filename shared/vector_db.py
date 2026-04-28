@@ -186,16 +186,20 @@ class VectorDB:
         return self.check_identifier(ticker, filter_key="ticker")
 
     def get_last_fetched(self, ticker: str) -> str | None:
-        """Return the fetched_at date string for the most recently stored reports, or None."""
-        dummy_vector = [0.1] + [0.0] * (self._DIMENSIONS[self.provider] - 1)
-        results = self.index.query(
-            vector=dummy_vector,
-            top_k=1,
-            filter={"ticker": {"$eq": ticker}},
-            include_metadata=True,
-        )
-        if results.matches:
-            return results.matches[0].metadata.get("fetched_at")
+        """Return the fetched_at date string for the most recently stored reports, or None.
+
+        Uses list(prefix=) + fetch() instead of a dummy-vector query to avoid a
+        3072-dim round-trip just for metadata retrieval.
+        """
+        try:
+            for chunk_ids in self.index.list(prefix=f"{ticker}_", limit=1):
+                if chunk_ids:
+                    fetched = self.index.fetch(ids=chunk_ids[:1])
+                    if fetched.vectors:
+                        return next(iter(fetched.vectors.values())).metadata.get("fetched_at")
+                break
+        except Exception as e:
+            logger.warning("get_last_fetched failed for %s: %s", ticker, e)
         return None
 
     # ---- Research papers ----
@@ -249,6 +253,38 @@ class VectorDB:
         )
         return bool(results.matches) and results.matches[0].score >= _EXIST_THRESHOLD
 
+    def rerank_candidates(self, query: str, candidates: list[dict], top_n: int) -> list[dict]:
+        """Rerank candidates by embedding similarity to the query.
+
+        Each candidate dict must have 'title' and 'summary' keys.
+        Returns the top_n most relevant candidates sorted by cosine similarity.
+        """
+        if len(candidates) <= top_n:
+            return candidates
+
+        candidate_texts = [f"{c['title']}. {c['summary']}" for c in candidates]
+        query_vector = self.embeddings.embed_query(query)
+        candidate_vectors = self.embeddings.embed_documents(candidate_texts)
+
+        similarities = [
+            (i, sum(q * c for q, c in zip(query_vector, cvec)))
+            for i, cvec in enumerate(candidate_vectors)
+        ]
+        similarities.sort(key=lambda x: x[1], reverse=True)
+
+        reranked = []
+        for idx, score in similarities[:top_n]:
+            candidates[idx]["_relevance_score"] = round(score, 4)
+            reranked.append(candidates[idx])
+
+        logger.info(
+            "Reranked %d candidates → top %d (scores: %.3f – %.3f)",
+            len(candidates), len(reranked),
+            reranked[0].get("_relevance_score", 0),
+            reranked[-1].get("_relevance_score", 0),
+        )
+        return reranked
+
 
 class UserKnowledgeDB:
     """Semantic memory store: durable user facts extracted from sessions.
@@ -295,10 +331,12 @@ class UserKnowledgeDB:
     def upsert_facts(self, user_id: str, facts: list[str]) -> int:
         """Upsert facts with deduplication. Returns number of new facts inserted."""
         import uuid
+        if not facts:
+            return 0
+        # Batch-embed all facts in one call instead of one embed per fact
+        vectors = self.embeddings.embed_documents(facts)
         upserted = 0
-        for fact in facts:
-            vec = self.embeddings.embed_query(fact)
-            # Check for near-duplicate before upserting
+        for fact, vec in zip(facts, vectors):
             existing = self.index.query(
                 vector=vec,
                 top_k=1,

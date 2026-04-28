@@ -2,10 +2,11 @@
 
 import json
 import logging
-import time
+import sys
+from datetime import datetime
+from pathlib import Path
 
 import httpx
-import requests
 import yfinance as yf
 from cachetools import cached, TTLCache
 from dotenv import load_dotenv
@@ -14,138 +15,27 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 load_dotenv()
 
-# ── Macro data cache (6-hour TTL) to avoid hammering public APIs ──
-_macro_cache: dict[str, tuple[float, str]] = {}
-_CACHE_TTL = 6 * 3600
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from shared.ticker_aliases import INDIAN_TICKER_ALIASES
 
 logger = logging.getLogger("mcp_tool_servers.finance_data")
 
 mcp = FastMCP("finance-data", instructions="Financial market data and reports tools.")
 
-# ── Indian ticker alias table ── keys are lowercase normalized inputs, values are bare NSE symbols ──
-_INDIAN_TICKER_ALIASES: dict[str, str] = {
-    # PSU Banks
-    "sbi": "SBIN", "state bank": "SBIN", "state bank of india": "SBIN", "sbin": "SBIN",
-    "pnb": "PNB", "punjab national bank": "PNB",
-    "bob": "BANKBARODA", "bank of baroda": "BANKBARODA", "bankbaroda": "BANKBARODA",
-    "boi": "BANKINDIA", "bank of india": "BANKINDIA", "bankindia": "BANKINDIA",
-    "ubi": "UNIONBANK", "union bank": "UNIONBANK", "union bank of india": "UNIONBANK", "unionbank": "UNIONBANK",
-    "canara": "CANBK", "canara bank": "CANBK", "canbk": "CANBK",
-    "uco": "UCOBANK", "uco bank": "UCOBANK", "ucobank": "UCOBANK",
-    "iob": "IOB", "indian overseas bank": "IOB",
-    "central bank": "CENTRALBK", "centralbk": "CENTRALBK",
-    "indian bank": "INDIANB", "indianb": "INDIANB",
-    "mahabank": "MAHABANK", "maharashtra bank": "MAHABANK",
-    # Private Banks
-    "hdfc bank": "HDFCBANK", "hdfcbank": "HDFCBANK", "hdfc": "HDFCBANK",
-    "icici bank": "ICICIBANK", "icicibank": "ICICIBANK", "icici": "ICICIBANK",
-    "axis bank": "AXISBANK", "axisbank": "AXISBANK", "axis": "AXISBANK",
-    "kotak": "KOTAKBANK", "kotak bank": "KOTAKBANK", "kotakbank": "KOTAKBANK",
-    "kotak mahindra bank": "KOTAKBANK",
-    "indusind": "INDUSINDBK", "indusind bank": "INDUSINDBK", "indusindbk": "INDUSINDBK",
-    "yes bank": "YESBANK", "yesbank": "YESBANK",
-    "idfc first": "IDFCFIRSTB", "idfc first bank": "IDFCFIRSTB", "idfcfirstb": "IDFCFIRSTB",
-    "federal bank": "FEDERALBNK", "federalbnk": "FEDERALBNK",
-    "bandhan bank": "BANDHANBNK", "bandhanbnk": "BANDHANBNK",
-    "rbl bank": "RBLBANK", "rblbank": "RBLBANK",
-    "karnataka bank": "KTKBANK", "ktkbank": "KTKBANK",
-    "south indian bank": "SOUTHBANK", "southbank": "SOUTHBANK",
-    # IT / Technology
-    "tcs": "TCS", "tata consultancy": "TCS", "tata consultancy services": "TCS",
-    "infy": "INFY", "infosys": "INFY",
-    "wipro": "WIPRO",
-    "hcl": "HCLTECH", "hcl tech": "HCLTECH", "hcltech": "HCLTECH", "hcl technologies": "HCLTECH",
-    "tech mahindra": "TECHM", "techm": "TECHM",
-    "ltimindtree": "LTIM", "lti mindtree": "LTIM", "ltim": "LTIM",
-    "mphasis": "MPHASIS",
-    "persistent": "PERSISTENT", "persistent systems": "PERSISTENT",
-    "coforge": "COFORGE",
-    "hexaware": "HEXAWARE",
-    # Large Caps / Nifty 50
-    "reliance": "RELIANCE", "ril": "RELIANCE", "reliance industries": "RELIANCE",
-    "itc": "ITC",
-    "hul": "HINDUNILVR", "hindustan unilever": "HINDUNILVR", "hindunilvr": "HINDUNILVR",
-    "bajaj finance": "BAJFINANCE", "bajfinance": "BAJFINANCE",
-    "bajaj finserv": "BAJAJFINSV", "bajajfinsv": "BAJAJFINSV",
-    "l&t": "LT", "lt": "LT", "larsen": "LT", "larsen and toubro": "LT",
-    "maruti": "MARUTI", "maruti suzuki": "MARUTI",
-    "tata motors": "TATAMOTORS", "tatamotors": "TATAMOTORS",
-    "m&m": "M&M", "mahindra": "M&M", "mahindra and mahindra": "M&M",
-    "hero motocorp": "HEROMOTOCO", "heromotoco": "HEROMOTOCO",
-    "bajaj auto": "BAJAJ-AUTO", "bajaj-auto": "BAJAJ-AUTO",
-    "tata steel": "TATASTEEL", "tatasteel": "TATASTEEL",
-    "jsw steel": "JSWSTEEL", "jswsteel": "JSWSTEEL",
-    "hindalco": "HINDALCO",
-    "vedanta": "VEDL", "vedl": "VEDL",
-    "ntpc": "NTPC",
-    "powergrid": "POWERGRID", "power grid": "POWERGRID",
-    "ongc": "ONGC",
-    "coal india": "COALINDIA", "coalindia": "COALINDIA",
-    "bpcl": "BPCL", "bharat petroleum": "BPCL",
-    "hpcl": "HPCL", "hindustan petroleum": "HPCL",
-    "ioc": "IOC", "iocl": "IOC", "indian oil": "IOC",
-    "gail": "GAIL",
-    "sun pharma": "SUNPHARMA", "sunpharma": "SUNPHARMA",
-    "dr reddy": "DRREDDY", "drreddy": "DRREDDY", "dr reddys": "DRREDDY",
-    "cipla": "CIPLA",
-    "divis": "DIVISLAB", "divis lab": "DIVISLAB", "divislab": "DIVISLAB",
-    "apollo hospitals": "APOLLOHOSP", "apollohosp": "APOLLOHOSP",
-    "asian paints": "ASIANPAINT", "asianpaint": "ASIANPAINT",
-    "nestle india": "NESTLEIND", "nestleind": "NESTLEIND",
-    "britannia": "BRITANNIA",
-    "adani ports": "ADANIPORTS", "adaniports": "ADANIPORTS",
-    "adani green": "ADANIGREEN", "adanigreen": "ADANIGREEN",
-    "adani ent": "ADANIENT", "adanient": "ADANIENT", "adani enterprises": "ADANIENT",
-    "adani total gas": "ATGL", "atgl": "ATGL",
-    "tata consumer": "TATACONSUM", "tataconsum": "TATACONSUM",
-    "ultracemco": "ULTRACEMCO", "ultratech cement": "ULTRACEMCO",
-    "shree cement": "SHREECEM", "shreecem": "SHREECEM",
-    "acc": "ACC", "acc cement": "ACC",
-    "ambuja cement": "AMBUJACEM", "ambujacem": "AMBUJACEM",
-    "siemens": "SIEMENS",
-    "abb india": "ABB", "abb": "ABB",
-    "bhel": "BHEL",
-    "irfc": "IRFC",
-    "lic": "LICI", "lici": "LICI", "life insurance corporation": "LICI",
-    "sbi life": "SBILIFE", "sbilife": "SBILIFE",
-    "hdfc life": "HDFCLIFE", "hdfclife": "HDFCLIFE",
-    "icici prudential": "ICICIPRULI", "icicipruli": "ICICIPRULI",
-    "zomato": "ZOMATO",
-    "paytm": "PAYTM",
-    "nykaa": "FSN", "fsn": "FSN",
-    "dmart": "DMART", "avenue supermarts": "DMART",
-    "titan": "TITAN",
-    "havells": "HAVELLS",
-    "voltas": "VOLTAS",
-    "pidilite": "PIDILITIND", "pidilitind": "PIDILITIND",
-    "berger paints": "BERGEPAINT", "bergepaint": "BERGEPAINT",
-    "godrej consumer": "GODREJCP", "godrejcp": "GODREJCP",
-    "dabur": "DABUR",
-    "colgate": "COLPAL", "colgate palmolive india": "COLPAL", "colpal": "COLPAL",
-    "marico": "MARICO",
-    "emami": "EMAMILTD", "emamiltd": "EMAMILTD",
-    "page industries": "PAGEIND", "pageind": "PAGEIND",
-    "info edge": "NAUKRI", "naukri": "NAUKRI",
-    "indigo": "INDIGO", "interglobe aviation": "INDIGO",
-    "irctc": "IRCTC",
-    "mrf": "MRF",
-    "tvs motor": "TVSMOTOR", "tvsmotor": "TVSMOTOR",
-    "eicher motors": "EICHERMOT", "eichermot": "EICHERMOT",
-    "srf": "SRF",
-    "pi industries": "PIIND", "piind": "PIIND",
-    "upl": "UPL",
-    "tata power": "TATAPOWER", "tatapower": "TATAPOWER",
-    "nhpc": "NHPC",
-    "torrent power": "TORNTPOWER", "torntpower": "TORNTPOWER",
-    "tata chemicals": "TATACHEM", "tatachem": "TATACHEM",
-    "tata elxsi": "TATAELXSI", "tataelxsi": "TATAELXSI",
-    "muthoot finance": "MUTHOOTFIN", "muthootfin": "MUTHOOTFIN",
-    "cholamandalam": "CHOLAFIN", "cholafin": "CHOLAFIN",
-    "l&t finance": "LTF", "ltf": "LTF",
-    "shriram finance": "SHRIRAMFIN", "shriramfin": "SHRIRAMFIN",
-    "hdfc amc": "HDFCAMC", "hdfcamc": "HDFCAMC",
-    "nippon amc": "NAM-INDIA", "nam-india": "NAM-INDIA",
+_MACRO_CACHE_TTL = 6 * 3600
+_macro_cache: TTLCache = TTLCache(maxsize=16, ttl=_MACRO_CACHE_TTL)
+
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
 }
+
 
 
 @mcp.tool()
@@ -173,8 +63,8 @@ def resolve_indian_ticker(company_name_or_symbol: str) -> str:
     elif normalized.endswith(".bo"):
         normalized = normalized[:-3]
 
-    if normalized in _INDIAN_TICKER_ALIASES:
-        nse_symbol = _INDIAN_TICKER_ALIASES[normalized]
+    if normalized in INDIAN_TICKER_ALIASES:
+        nse_symbol = INDIAN_TICKER_ALIASES[normalized]
         ticker_with_suffix = f"{nse_symbol}.NS"
         logger.info("Alias table hit: '%s' → '%s'", company_name_or_symbol, ticker_with_suffix)
         try:
@@ -373,20 +263,13 @@ def get_historical_ohlcv(ticker: str, period: str = "1y", interval: str = "1d", 
 
 
 @mcp.tool()
+@cached(cache=_macro_cache)
 def get_macro_indicators() -> str:
     """Fetch key Indian and global macro market indicators.
     Returns USD/INR, Brent Crude, Gold, US 10Y Treasury yield, Nifty 50, Sensex,
     India VIX, and US Dollar Index — all with day-over-day change.
     Results are cached for 6 hours.
     Note: For RBI repo rate and CPI/IIP data use tavily_quick_search('RBI repo rate India 2026')."""
-    cache_key = "macro_indicators"
-    now = time.time()
-    if cache_key in _macro_cache:
-        ts, cached = _macro_cache[cache_key]
-        if now - ts < _CACHE_TTL:
-            logger.info("Returning cached macro indicators")
-            return cached
-
     logger.info("Fetching macro indicators from yfinance")
     indicators = [
         ("USDINR=X", "USD/INR"),
@@ -428,9 +311,7 @@ def get_macro_indicators() -> str:
     if failed:
         lines.append(f"\n**Unavailable:** {', '.join(failed)} — use tavily_quick_search for these.")
 
-    result = "\n".join(lines)
-    _macro_cache[cache_key] = (now, result)
-    return result
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -448,18 +329,7 @@ async def get_fii_dii_flows(days: int = 30) -> str:
 
     logger.info("Fetching FII/DII flows for last %d days", days)
     try:
-        _NSE_HEADERS = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/",
-        }
         async with httpx.AsyncClient(headers=_NSE_HEADERS, timeout=15, follow_redirects=True) as client:
-            # Initialize NSE session to get cookies
             await client.get("https://www.nseindia.com")
             resp = await client.get("https://www.nseindia.com/api/fiidiiTradeReact")
         resp.raise_for_status()
@@ -509,8 +379,6 @@ def get_dcf_inputs(ticker: str) -> str:
 
     For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g. 'JSWSTEEL.NS'.
     """
-    import json
-
     logger.info("get_dcf_inputs called for ticker='%s'", ticker)
     try:
         t = yf.Ticker(ticker)
@@ -631,8 +499,6 @@ def get_price_series(ticker: str, period: str = "1y") -> str:
     period options: 3mo, 6mo, 1y, 2y (default: 1y)
     For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g. 'JSWSTEEL.NS'.
     """
-    import json
-
     logger.info("get_price_series called for ticker='%s', period='%s'", ticker, period)
     try:
         hist = _yf_get_history(ticker, period=period, interval="1d")
@@ -663,8 +529,6 @@ def get_comparable_metrics(tickers: list[str]) -> str:
     For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g. ['JSWSTEEL.NS', 'TATASTEEL.NS'].
     At least 2 tickers are recommended (1 target + 1 peer minimum).
     """
-    import json
-
     if not tickers:
         return json.dumps({"error": "At least one ticker required"})
 
@@ -712,7 +576,7 @@ def get_comparable_metrics(tickers: list[str]) -> str:
 
 
 @mcp.tool()
-def get_regime_inputs() -> str:
+async def get_regime_inputs() -> str:
     """Fetch and structure current Indian macro indicators as inputs for detect_market_regime.
 
     Returns a JSON object whose field names match RegimeDetectorInput exactly:
@@ -723,8 +587,6 @@ def get_regime_inputs() -> str:
     Pass the returned values directly to detect_market_regime — do NOT use
     the markdown output of get_macro_indicators for this purpose.
     """
-    import json
-
     logger.info("get_regime_inputs called")
     result: dict = {}
     warnings: list[str] = []
@@ -756,19 +618,11 @@ def get_regime_inputs() -> str:
     except Exception as e:
         warnings.append(f"nifty_pe unavailable: {e}")
 
-    # ── FII net 30-day flows from NSE ────────────────────────────────────────
+    # ── FII net 30-day flows from NSE (async httpx) ──────────────────────────
     try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.nseindia.com/",
-        })
-        session.get("https://www.nseindia.com", timeout=10)
-        resp = session.get("https://www.nseindia.com/api/fiidiiTradeReact", timeout=10)
+        async with httpx.AsyncClient(headers=_NSE_HEADERS, timeout=15, follow_redirects=True) as client:
+            await client.get("https://www.nseindia.com")
+            resp = await client.get("https://www.nseindia.com/api/fiidiiTradeReact")
         resp.raise_for_status()
         data = resp.json()
         fii_net = sum(
@@ -781,11 +635,14 @@ def get_regime_inputs() -> str:
         warnings.append(f"fii_net_30d unavailable from NSE: {e}")
 
     # ── Fields that need search ──────────────────────────────────────────────
+    now = datetime.now()
+    month_year = now.strftime("%B %Y")
+    prev_month_year = now.replace(day=1).replace(month=now.month - 1 if now.month > 1 else 12).strftime("%B %Y")
     result["needs_search"] = {
-        "repo_rate": "tavily_quick_search('RBI repo rate India April 2026')",
-        "cpi_yoy": "tavily_quick_search('India CPI inflation YoY March 2026')",
-        "credit_growth": "tavily_quick_search('India bank credit growth YoY 2026')",
-        "gsec_10y": "tavily_quick_search('India 10 year G-sec yield today 2026')",
+        "repo_rate": f"tavily_quick_search('RBI repo rate India {month_year}')",
+        "cpi_yoy": f"tavily_quick_search('India CPI inflation YoY {prev_month_year}')",
+        "credit_growth": f"tavily_quick_search('India bank credit growth YoY {now.year}')",
+        "gsec_10y": "tavily_quick_search('India 10 year G-sec yield today')",
     }
     if warnings:
         result["warnings"] = warnings
@@ -802,8 +659,6 @@ def get_earnings_calendar(ticker: str) -> str:
     estimates (EPS and revenue) where available from yfinance.
     For Indian stocks use .NS (NSE) or .BO (BSE) suffix, e.g. 'HDFCBANK.NS'.
     """
-    import json
-
     logger.info("get_earnings_calendar called for ticker='%s'", ticker)
     try:
         t = yf.Ticker(ticker)
@@ -829,8 +684,7 @@ def get_earnings_calendar(ticker: str) -> str:
         # Dividend info
         ex_div = info.get("exDividendDate")
         if ex_div:
-            from datetime import datetime as _dt
-            result["ex_dividend_date"] = _dt.fromtimestamp(ex_div).strftime("%Y-%m-%d")
+            result["ex_dividend_date"] = datetime.fromtimestamp(ex_div).strftime("%Y-%m-%d")
         div_rate = info.get("dividendRate")
         if div_rate:
             result["annual_dividend"] = round(float(div_rate), 2)
@@ -872,7 +726,6 @@ def run_scenario_simulation(
         current_sip_monthly: Optional monthly SIP amount in INR. 0 if not applicable.
         holding_period_years: How many years to project the scenario over.
     """
-    import json
     import math
 
     logger.info("run_scenario_simulation: ticker='%s', shock=%.1f%%, sip=%.0f, years=%.1f",
