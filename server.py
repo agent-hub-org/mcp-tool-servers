@@ -12,6 +12,7 @@ import arxiv
 import base64
 import re
 import httpx
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -405,24 +406,27 @@ def get_fii_dii_flows(days: int = 30) -> str:
     logger.info("Fetching FII/DII flows for last %d days", days)
     try:
         session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/",
-        })
-        session.get("https://www.nseindia.com", timeout=15)
+        try:
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.nseindia.com/",
+            })
+            session.get("https://www.nseindia.com", timeout=15)
 
-        resp = session.get(
-            "https://www.nseindia.com/api/fiidiiTradeReact",
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+            resp = session.get(
+                "https://www.nseindia.com/api/fiidiiTradeReact",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        finally:
+            session.close()
 
         if not data:
             return "No FII/DII data returned from NSE."
