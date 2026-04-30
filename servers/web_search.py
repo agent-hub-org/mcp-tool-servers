@@ -72,7 +72,7 @@ async def _rewrite_query_for_web(query: str) -> str:
     try:
         client = _get_azure_openai()
         response = await client.chat.completions.create(
-            model="gpt-5-nano",
+            model=os.getenv("AZURE_QUERY_REWRITE_MODEL", "gpt-4o-mini"),
             messages=[
                 {
                     "role": "system",
@@ -139,9 +139,8 @@ def firecrawl_deep_scrape(url: str) -> str:
     try:
         app = _get_firecrawl()
         scrape_result = app.scrape(url, formats=["markdown"])
-        markdown = scrape_result.get("markdown", "")
-        metadata = scrape_result.get("metadata", {})
-        title = metadata.get("title", "")
+        markdown = scrape_result.markdown or ""
+        title = (scrape_result.metadata.title if scrape_result.metadata else "") or ""
         return f"# {title}\n\n{markdown}" if title else markdown
     except Exception as e:
         logger.error("Firecrawl scrape error: %s", e)
