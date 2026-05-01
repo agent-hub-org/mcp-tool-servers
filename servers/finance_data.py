@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -610,17 +610,19 @@ async def get_regime_inputs() -> str:
     try:
         from nsepython import nse_fiidii
         df = await asyncio.to_thread(nse_fiidii)
-        # Filter FII rows and sum netValue over the first 30 trading days
-        fii_rows = df[df["category"].str.upper().str.contains("FII", na=False)].head(30)
-        fii_net = (
-            fii_rows["netValue"]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .apply(pd.to_numeric, errors="coerce")
-            .fillna(0)
-            .sum()
-        )
-        result["fii_net_30d"] = round(float(fii_net), 2)
+        if df is None or df.empty:
+            warnings.append("fii_net_30d unavailable: nse_fiidii returned no data")
+        else:
+            fii_rows = df[df["category"].str.upper().str.contains("FII", na=False)].head(30)
+            fii_net = (
+                fii_rows["netValue"]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .apply(pd.to_numeric, errors="coerce")
+                .fillna(0)
+                .sum()
+            )
+            result["fii_net_30d"] = round(float(fii_net), 2)
     except Exception as e:
         warnings.append(f"fii_net_30d unavailable from nsepython: {e}")
 
