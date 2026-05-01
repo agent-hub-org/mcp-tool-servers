@@ -1,12 +1,13 @@
 """MCP server for finance data tools (yfinance + BSE/NSE reports). Port 8011."""
 
+import asyncio
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import httpx
+import pandas as pd
 import yfinance as yf
 from cachetools import cached, TTLCache
 from dotenv import load_dotenv
@@ -24,17 +25,6 @@ mcp = FastMCP("finance-data", instructions="Financial market data and reports to
 
 _MACRO_CACHE_TTL = 6 * 3600
 _macro_cache: TTLCache = TTLCache(maxsize=16, ttl=_MACRO_CACHE_TTL)
-
-_NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-}
 
 
 
@@ -329,18 +319,16 @@ async def get_fii_dii_flows(days: int = 30) -> str:
 
     logger.info("Fetching FII/DII flows for last %d days", days)
     try:
-        async with httpx.AsyncClient(headers=_NSE_HEADERS, timeout=15, follow_redirects=True) as client:
-            await client.get("https://www.nseindia.com")
-            resp = await client.get("https://www.nseindia.com/api/fiidiiTradeReact")
-        resp.raise_for_status()
-        data = resp.json()
+        from nsepython import nse_fiidii
 
-        if not data:
+        df = await asyncio.to_thread(nse_fiidii)
+
+        if df is None or df.empty:
             return "No FII/DII data returned from NSE."
 
-        recent = data[:days]
+        recent = df.head(days)
         lines = [f"## FII/DII Equity Flows — Last {len(recent)} Trading Days (NSE)", ""]
-        for entry in recent:
+        for _, entry in recent.iterrows():
             category = entry.get("category", "?")
             date = entry.get("date", "")
             buy_val = entry.get("buyValue", "0")
@@ -618,21 +606,23 @@ async def get_regime_inputs() -> str:
     except Exception as e:
         warnings.append(f"nifty_pe unavailable: {e}")
 
-    # ── FII net 30-day flows from NSE (async httpx) ──────────────────────────
+    # ── FII net 30-day flows from nsepython ──────────────────────────────────
     try:
-        async with httpx.AsyncClient(headers=_NSE_HEADERS, timeout=15, follow_redirects=True) as client:
-            await client.get("https://www.nseindia.com")
-            resp = await client.get("https://www.nseindia.com/api/fiidiiTradeReact")
-        resp.raise_for_status()
-        data = resp.json()
-        fii_net = sum(
-            float(str(e.get("netValue", "0")).replace(",", ""))
-            for e in data[:30]
-            if "FII" in str(e.get("category", "")).upper()
+        from nsepython import nse_fiidii
+        df = await asyncio.to_thread(nse_fiidii)
+        # Filter FII rows and sum netValue over the first 30 trading days
+        fii_rows = df[df["category"].str.upper().str.contains("FII", na=False)].head(30)
+        fii_net = (
+            fii_rows["netValue"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0)
+            .sum()
         )
-        result["fii_net_30d"] = round(fii_net, 2)
+        result["fii_net_30d"] = round(float(fii_net), 2)
     except Exception as e:
-        warnings.append(f"fii_net_30d unavailable from NSE: {e}")
+        warnings.append(f"fii_net_30d unavailable from nsepython: {e}")
 
     # ── Fields that need search ──────────────────────────────────────────────
     now = datetime.now()
